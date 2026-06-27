@@ -1,4 +1,4 @@
-import { Innertube, ClientType, UniversalCache } from "npm:youtubei.js";
+import { Innertube, UniversalCache } from "npm:youtubei.js";
 
 const kv = await Deno.openKv();
 
@@ -17,34 +17,42 @@ function err(msg: string, status = 500) {
   return json({ error: msg }, status);
 }
 
-const createTvYt = async () => {
-  return await Innertube.create({
-    location: "RU",
-    lang: "ru",
-    cache: new UniversalCache(false),
-  });
+// Custom JS evaluator for deciphering — deno allows new Function
+const customEvaluator = (code: string) => {
+  return new Function(code)();
 };
 
 const createYt = async (credentials?: any) => {
   const instance = await Innertube.create({
-    location: "RU",
-    lang: "ru",
+    location: "US",
+    lang: "en",
     cache: new UniversalCache(false),
   });
   if (credentials) await instance.session.signIn(credentials);
   return instance;
 };
 
-// WEB client for stream URLs — uses decipher() which works on deno deploy since eval/new Function is allowed
 const createYtForStreams = async (credentials?: any) => {
   const instance = await Innertube.create({
-    location: "RU",
-    lang: "ru",
+    location: "US",
+    lang: "en",
     cache: new UniversalCache(false),
-    retrieve_player: true, // needed for decipher
+    retrieve_player: true,
   });
+  // provide custom evaluator for deciphering stream URLs
+  if (instance.session.player) {
+    (instance.session.player as any).evaluate = customEvaluator;
+  }
   if (credentials) await instance.session.signIn(credentials);
   return instance;
+};
+
+const createTvYt = async () => {
+  return await Innertube.create({
+    location: "US",
+    lang: "en",
+    cache: new UniversalCache(false),
+  });
 };
 
 const getSession = async (sessionId: string | null) => {
@@ -237,7 +245,6 @@ Deno.serve(async (req) => {
       if (!videoId) return err("missing videoId", 400);
 
       const creds = await requireAuth(sessionId);
-      // Use streams instance (retrieve_player: true) for deciphering
       const streamInstance = creds ? await createYtForStreams(creds) : ytStreams;
       const streamInfo = await streamInstance.getBasicInfo(videoId);
       const streamingData = streamInfo.streaming_data;
