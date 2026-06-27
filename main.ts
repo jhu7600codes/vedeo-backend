@@ -378,6 +378,7 @@ Deno.serve(async (req) => {
 
       // Fallback: use truehosting direct stream if innertube fails
       const fallbackStreamUrl = `/proxy?url=${encodeURIComponent(`${TRUEHOSTING_BASE}/embed/${videoId}?raw=1&quality=720p`)}`;
+      const dashManifestUrl = `/proxy?url=${encodeURIComponent(`${TRUEHOSTING_BASE}/api/v1/manifest/dash/id/${videoId}.mpd`)}`;
 
       return json({
         id: videoId,
@@ -385,6 +386,7 @@ Deno.serve(async (req) => {
         formats,
         adaptiveFormats,
         fallbackStreamUrl,
+        dashManifestUrl,
       });
     }
 
