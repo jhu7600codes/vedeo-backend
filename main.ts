@@ -378,7 +378,7 @@ Deno.serve(async (req) => {
 
       // Fallback: use truehosting direct stream if innertube fails
       const fallbackStreamUrl = `/proxy?url=${encodeURIComponent(`${TRUEHOSTING_BASE}/embed/${videoId}?raw=1&quality=720p`)}`;
-      const dashManifestUrl = `/proxy?url=${encodeURIComponent(`${TRUEHOSTING_BASE}/api/v1/manifest/dash/id/${videoId}.mpd`)}`;
+      const dashManifestUrl = `/manifest/${videoId}.mpd`;
 
       return json({
         id: videoId,
@@ -522,6 +522,36 @@ Deno.serve(async (req) => {
           fallbackStreamUrl: `/proxy?url=${encodeURIComponent(`${TRUEHOSTING_BASE}/embed/${v.id}?raw=1&quality=720p`)}`,
         }));
       return json({ shorts });
+    }
+
+    // GET /manifest/{videoId}.mpd — rewrites DASH manifest URLs through deno proxy
+    if (path.startsWith("/manifest/") && path.endsWith(".mpd")) {
+      const videoId = path.split("/manifest/")[1].replace(".mpd", "");
+      if (!videoId) return err("missing videoId", 400);
+
+      const manifestUrl = `${TRUEHOSTING_BASE}/api/v1/manifest/dash/id/${videoId}.mpd`;
+      const res = await fetch(manifestUrl, {
+        headers: { "User-Agent": "Mozilla/5.0", "Referer": TRUEHOSTING_BASE }
+      });
+
+      if (!res.ok) return err("failed to fetch manifest", 502);
+
+      let manifest = await res.text();
+
+      // Rewrite all googlevideo.com URLs through our proxy so rkn can't block them
+      manifest = manifest.replace(
+        /https:\/\/[a-z0-9\-\.]+\.googlevideo\.com\/[^\s"<]*/g,
+        (match) => `https://vedeo-backend.vedeo.deno.net/proxy?url=${encodeURIComponent(match)}`
+      );
+
+      return new Response(manifest, {
+        status: 200,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Content-Type": "application/dash+xml",
+          "Cache-Control": "no-cache",
+        },
+      });
     }
 
     if (path === "/proxy") {
