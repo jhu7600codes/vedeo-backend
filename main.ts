@@ -1,6 +1,5 @@
 import { Innertube, Platform, UniversalCache } from "npm:youtubei.js";
 import type { Types } from "npm:youtubei.js";
-import { BG, buildURL } from "npm:bgutils-js";
 
 // Set custom JS evaluator BEFORE any Innertube.create() calls
 Platform.shim.eval = async (data: Types.BuildScriptResult) => {
@@ -24,86 +23,6 @@ function err(msg: string, status = 500) {
   return json({ error: msg }, status);
 }
 
-// Generate po_token using BgUtils — same library LuanRT uses
-// Cache it in KV so we don't regenerate on every request
-async function getPoToken(): Promise<{ poToken: string; visitorData: string }> {
-  const cached = (await kv.get(["po_token"])).value as any;
-  // Cache for 6 hours
-  if (cached && Date.now() - cached.generatedAt < 6 * 60 * 60 * 1000) {
-    return cached;
-  }
-
-  const tempYt = await Innertube.create({ cache: new UniversalCache(false) });
-  const challengeResponse = await tempYt.getAttestationChallenge("ENGAGEMENT_TYPE_UNBOUND");
-  
-  if (!challengeResponse.bg_challenge) throw new Error("Could not get BG challenge");
-
-  const interpreterUrl = challengeResponse.bg_challenge.interpreter_url
-    .private_do_not_access_or_else_trusted_resource_url_wrapped_value;
-  const bgScriptResponse = await fetch(`https:${interpreterUrl}`);
-  const interpreterJavascript = await bgScriptResponse.text();
-
-  const visitorData = tempYt.session.context.client.visitorData ?? "";
-
-  const bg = await BG.create({
-    requestKey: "O43z0dpjhgX20SCx4KAo",
-    program: challengeResponse.bg_challenge.program,
-    globalName: challengeResponse.bg_challenge.global_name,
-    interpreterHash: challengeResponse.bg_challenge.interpreter_hash,
-    clientExperiments: challengeResponse.bg_challenge.client_experiments_state_blob,
-    interpreterJavascript,
-    identifier: visitorData,
-    scriptExecutor: (s: string) => new Function(s)(),
-  });
-
-  const integrityToken = await bg.generateIntegrityToken(visitorData);
-  const poToken = integrityToken.acquirePoToken(visitorData);
-
-  const result = { poToken, visitorData, generatedAt: Date.now() };
-  await kv.set(["po_token"], result);
-  return result;
-}
-
-// Generate po_token for authenticated user
-async function getPoTokenForUser(credentials: any): Promise<{ poToken: string; visitorData: string }> {
-  const cacheKey = ["po_token_user", credentials?.access_token?.slice(-8) ?? "anon"];
-  const cached = (await kv.get(cacheKey)).value as any;
-  if (cached && Date.now() - cached.generatedAt < 6 * 60 * 60 * 1000) {
-    return cached;
-  }
-
-  const authedYt = await Innertube.create({ cache: new UniversalCache(false) });
-  await authedYt.session.signIn(credentials);
-
-  const challengeResponse = await authedYt.getAttestationChallenge("ENGAGEMENT_TYPE_UNBOUND");
-  if (!challengeResponse.bg_challenge) throw new Error("Could not get BG challenge");
-
-  const interpreterUrl = challengeResponse.bg_challenge.interpreter_url
-    .private_do_not_access_or_else_trusted_resource_url_wrapped_value;
-  const bgScriptResponse = await fetch(`https:${interpreterUrl}`);
-  const interpreterJavascript = await bgScriptResponse.text();
-
-  const visitorData = authedYt.session.context.client.visitorData ?? "";
-
-  const bg = await BG.create({
-    requestKey: "O43z0dpjhgX20SCx4KAo",
-    program: challengeResponse.bg_challenge.program,
-    globalName: challengeResponse.bg_challenge.global_name,
-    interpreterHash: challengeResponse.bg_challenge.interpreter_hash,
-    clientExperiments: challengeResponse.bg_challenge.client_experiments_state_blob,
-    interpreterJavascript,
-    identifier: visitorData,
-    scriptExecutor: (s: string) => new Function(s)(),
-  });
-
-  const integrityToken = await bg.generateIntegrityToken(visitorData);
-  const poToken = integrityToken.acquirePoToken(visitorData);
-
-  const result = { poToken, visitorData, generatedAt: Date.now() };
-  await kv.set(cacheKey, result);
-  return result;
-}
-
 const createYt = async (credentials?: any) => {
   const instance = await Innertube.create({
     location: "US",
@@ -115,17 +34,12 @@ const createYt = async (credentials?: any) => {
 };
 
 const createYtForStreams = async (credentials?: any) => {
-  const { poToken, visitorData } = credentials
-    ? await getPoTokenForUser(credentials)
-    : await getPoToken();
-
   const instance = await Innertube.create({
     location: "US",
     lang: "en",
     cache: new UniversalCache(false),
     retrieve_player: true,
-    po_token: poToken,
-    visitor_data: visitorData,
+    generate_session_locally: true,
   });
   if (credentials) await instance.session.signIn(credentials);
   return instance;
@@ -150,18 +64,8 @@ const requireAuth = async (sessionId: string | null) => {
   return session.credentials;
 };
 
-// Pre-generate po_token on startup
-const { poToken: initPoToken, visitorData: initVisitorData } = await getPoToken();
-
 const yt = await createYt();
-const ytStreams = await Innertube.create({
-  location: "US",
-  lang: "en",
-  cache: new UniversalCache(false),
-  retrieve_player: true,
-  po_token: initPoToken,
-  visitor_data: initVisitorData,
-});
+const ytStreams = await createYtForStreams();
 
 const proxyUrl = (rawUrl: string | null | undefined) =>
   rawUrl ? `/proxy?url=${encodeURIComponent(rawUrl)}` : null;
