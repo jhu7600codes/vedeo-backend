@@ -1,12 +1,13 @@
 import { Innertube, Platform, UniversalCache } from "npm:youtubei.js";
 import type { Types } from "npm:youtubei.js";
 
-// Set custom JS evaluator BEFORE any Innertube.create() calls
 Platform.shim.eval = async (data: Types.BuildScriptResult) => {
   return new Function(data.output)();
 };
 
 const kv = await Deno.openKv();
+
+const YT2009_BASE = "https://yt2009.truehosting.net";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -33,18 +34,6 @@ const createYt = async (credentials?: any) => {
   return instance;
 };
 
-const createYtForStreams = async (credentials?: any) => {
-  const instance = await Innertube.create({
-    location: "US",
-    lang: "en",
-    cache: new UniversalCache(false),
-    retrieve_player: true,
-    generate_session_locally: true,
-  });
-  if (credentials) await instance.session.signIn(credentials);
-  return instance;
-};
-
 const createTvYt = async () => {
   return await Innertube.create({
     location: "US",
@@ -65,22 +54,9 @@ const requireAuth = async (sessionId: string | null) => {
 };
 
 const yt = await createYt();
-const ytStreams = await createYtForStreams();
-
-const proxyUrl = (rawUrl: string | null | undefined) =>
-  rawUrl ? `/proxy?url=${encodeURIComponent(rawUrl)}` : null;
 
 const thumbUrl = (rawUrl: string | null | undefined) =>
   rawUrl ? `/thumbnail?url=${encodeURIComponent(rawUrl)}` : null;
-
-const getUrl = (f: any, player: any) => {
-  try {
-    const deciphered = f.decipher(player);
-    return deciphered ?? f.url ?? null;
-  } catch {
-    return f.url ?? null;
-  }
-};
 
 const mapVideo = (v: any) => ({
   id: v.id,
@@ -242,39 +218,8 @@ Deno.serve(async (req) => {
       const videoId = path.split("/video/")[1];
       if (!videoId) return err("missing videoId", 400);
 
-      const creds = await requireAuth(sessionId);
-      const streamInstance = creds ? await createYtForStreams(creds) : ytStreams;
-      const streamInfo = await streamInstance.getBasicInfo(videoId);
-      const streamingData = streamInfo.streaming_data;
-      const player = streamInstance.session.player;
-
-      const formats = (streamingData?.formats ?? []).map((f: any) => ({
-        url: proxyUrl(getUrl(f, player)),
-        quality: f.quality_label ?? f.quality,
-        mimeType: f.mime_type,
-        bitrate: f.bitrate,
-        width: f.width,
-        height: f.height,
-        fps: f.fps,
-        audioQuality: f.audio_quality,
-        hasAudio: !!f.audio_quality,
-        hasVideo: !!f.width,
-      })).filter((f: any) => f.url);
-
-      const adaptiveFormats = (streamingData?.adaptive_formats ?? []).map((f: any) => ({
-        url: proxyUrl(getUrl(f, player)),
-        quality: f.quality_label ?? f.quality,
-        mimeType: f.mime_type,
-        bitrate: f.bitrate,
-        width: f.width,
-        height: f.height,
-        fps: f.fps,
-        audioQuality: f.audio_quality,
-        isAudioOnly: f.mime_type?.startsWith("audio"),
-        isVideoOnly: f.mime_type?.startsWith("video") && !f.audio_quality,
-      })).filter((f: any) => f.url);
-
-      const webInstance = creds ? await createYt(creds) : yt;
+      // Get metadata from innertube
+      const webInstance = sessionId ? await createYt(await requireAuth(sessionId) ?? undefined) : yt;
       const webInfo = await webInstance.getInfo(videoId);
       const details = webInfo.basic_info;
 
@@ -290,6 +235,9 @@ Deno.serve(async (req) => {
         isShort: r.is_short,
       })) ?? [];
 
+      // Stream URL from yt2009.truehosting.net — proxied through deno
+      const streamUrl = `/proxy?url=${encodeURIComponent(`${YT2009_BASE}/get_video?video_id=${videoId}`)}`;
+
       return json({
         id: details.id,
         title: details.title,
@@ -303,8 +251,7 @@ Deno.serve(async (req) => {
         isLive: details.is_live,
         isShort: details.is_short,
         publishedAt: details.publish_date,
-        formats,
-        adaptiveFormats,
+        streamUrl,
         related,
       });
     }
@@ -414,10 +361,12 @@ Deno.serve(async (req) => {
           channel: v.author?.name,
           channelId: v.author?.id,
           views: v.view_count?.text,
+          streamUrl: `/proxy?url=${encodeURIComponent(`${YT2009_BASE}/get_video?video_id=${v.id}`)}`,
         }));
       return json({ shorts });
     }
 
+    // Proxy — pipes yt2009.truehosting.net streams through deno, bypassing rkn
     if (path === "/proxy") {
       const target = url.searchParams.get("url");
       if (!target) return err("missing url param", 400);
@@ -425,8 +374,7 @@ Deno.serve(async (req) => {
       const range = req.headers.get("range");
       const fetchHeaders: HeadersInit = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.youtube.com/",
-        "Origin": "https://www.youtube.com",
+        "Referer": "https://yt2009.truehosting.net/",
       };
       if (range) fetchHeaders["Range"] = range;
 
