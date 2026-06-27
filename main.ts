@@ -8,6 +8,7 @@ Platform.shim.eval = async (data: Types.BuildScriptResult) => {
 const kv = await Deno.openKv();
 
 const YT2009_BASE = "https://yt2009.truehosting.net";
+const INVIDIOUS_BASE = "https://inv.thepixora.com";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -58,10 +59,13 @@ const yt = await createYt();
 const thumbUrl = (rawUrl: string | null | undefined) =>
   rawUrl ? `/thumbnail?url=${encodeURIComponent(rawUrl)}` : null;
 
+const fallbackThumb = (videoId: string) =>
+  thumbUrl(`https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`);
+
 const mapVideo = (v: any) => ({
   id: v.id,
   title: v.title?.text,
-  thumbnail: thumbUrl(v.thumbnails?.[0]?.url),
+  thumbnail: thumbUrl(v.thumbnails?.[0]?.url) ?? fallbackThumb(v.id),
   channel: v.author?.name,
   channelId: v.author?.id,
   channelAvatar: thumbUrl(v.author?.thumbnails?.[0]?.url),
@@ -71,6 +75,73 @@ const mapVideo = (v: any) => ({
   isLive: v.is_live,
   isShort: v.is_short,
 });
+
+// Fetch video metadata — innertube first, invidious fallback
+async function getVideoMeta(videoId: string, credentials?: any) {
+  let title, description, channel, channelId, views, likes, duration, isLive, isShort, publishedAt, thumbnail, related: any[] = [];
+
+  // Try innertube
+  try {
+    const webInstance = credentials ? await createYt(credentials) : yt;
+    const webInfo = await webInstance.getInfo(videoId);
+    const details = webInfo.basic_info;
+    if (details.title) {
+      title = details.title;
+      description = details.short_description;
+      channel = details.author;
+      channelId = details.channel_id;
+      views = details.view_count;
+      likes = details.like_count;
+      duration = details.duration;
+      isLive = details.is_live;
+      isShort = details.is_short;
+      publishedAt = details.publish_date;
+      thumbnail = thumbUrl(details.thumbnail?.[0]?.url) ?? fallbackThumb(videoId);
+      related = webInfo.watch_next_feed?.map((r: any) => ({
+        id: r.id,
+        title: r.title?.text,
+        thumbnail: thumbUrl(r.thumbnails?.[0]?.url) ?? fallbackThumb(r.id),
+        channel: r.author?.name,
+        channelId: r.author?.id,
+        views: r.view_count?.text,
+        duration: r.duration?.text,
+        publishedAt: r.published?.text,
+        isShort: r.is_short,
+      })) ?? [];
+    }
+  } catch (_) {}
+
+  // Fall back to invidious if innertube returned nothing
+  if (!title) {
+    try {
+      const res = await fetch(`${INVIDIOUS_BASE}/api/v1/videos/${videoId}`);
+      const data = await res.json();
+      title = data.title;
+      description = data.description;
+      channel = data.author;
+      channelId = data.authorId;
+      views = data.viewCount;
+      likes = data.likeCount;
+      duration = data.lengthSeconds;
+      isLive = data.liveNow;
+      isShort = data.isShort ?? false;
+      publishedAt = data.published;
+      thumbnail = thumbUrl(data.videoThumbnails?.[0]?.url) ?? fallbackThumb(videoId);
+      related = (data.recommendedVideos ?? []).map((r: any) => ({
+        id: r.videoId,
+        title: r.title,
+        thumbnail: fallbackThumb(r.videoId),
+        channel: r.author,
+        channelId: r.authorId,
+        views: r.viewCountText,
+        duration: r.lengthSeconds,
+        isShort: false,
+      }));
+    } catch (_) {}
+  }
+
+  return { title, description, channel, channelId, views, likes, duration, isLive, isShort, publishedAt, thumbnail, related };
+}
 
 Deno.serve(async (req) => {
   const url = new URL(req.url);
@@ -82,6 +153,8 @@ Deno.serve(async (req) => {
   }
 
   try {
+
+    // ─── AUTH (innertube TV OAuth) ───────────────────────────────────────
 
     if (path === "/auth/start" && req.method === "POST") {
       const id = crypto.randomUUID();
@@ -140,6 +213,8 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
+    // ─── FEED (innertube) ────────────────────────────────────────────────
+
     if (path === "/feed") {
       const creds = await requireAuth(sessionId);
       if (!creds) return json({ error: "feed_404" }, 401);
@@ -154,6 +229,8 @@ Deno.serve(async (req) => {
       const videos = results.videos?.map(mapVideo) ?? [];
       return json({ videos });
     }
+
+    // ─── SUBSCRIPTIONS (innertube) ───────────────────────────────────────
 
     if (path === "/subscriptions") {
       const creds = await requireAuth(sessionId);
@@ -184,6 +261,8 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
+    // ─── SEARCH (innertube) ──────────────────────────────────────────────
+
     if (path === "/search") {
       const q = url.searchParams.get("q");
       if (!q) return err("missing q param", 400);
@@ -192,7 +271,7 @@ Deno.serve(async (req) => {
         type: r.type,
         id: r.id,
         title: r.title?.text ?? r.name?.text,
-        thumbnail: thumbUrl(r.thumbnails?.[0]?.url),
+        thumbnail: thumbUrl(r.thumbnails?.[0]?.url) ?? fallbackThumb(r.id),
         channel: r.author?.name,
         channelId: r.author?.id,
         channelAvatar: thumbUrl(r.author?.thumbnails?.[0]?.url),
@@ -214,47 +293,21 @@ Deno.serve(async (req) => {
       return json({ suggestions });
     }
 
+    // ─── VIDEO (innertube metadata + invidious fallback, yt2009 streams) ─
+
     if (path.startsWith("/video/")) {
       const videoId = path.split("/video/")[1];
       if (!videoId) return err("missing videoId", 400);
 
-      // Get metadata from innertube
-      const webInstance = sessionId ? await createYt(await requireAuth(sessionId) ?? undefined) : yt;
-      const webInfo = await webInstance.getInfo(videoId);
-      const details = webInfo.basic_info;
+      const creds = await requireAuth(sessionId);
+      const meta = await getVideoMeta(videoId, creds ?? undefined);
 
-      const related = webInfo.watch_next_feed?.map((r: any) => ({
-        id: r.id,
-        title: r.title?.text,
-        thumbnail: thumbUrl(r.thumbnails?.[0]?.url),
-        channel: r.author?.name,
-        channelId: r.author?.id,
-        views: r.view_count?.text,
-        duration: r.duration?.text,
-        publishedAt: r.published?.text,
-        isShort: r.is_short,
-      })) ?? [];
-
-      // Stream URL from yt2009.truehosting.net — proxied through deno
       const streamUrl = `/proxy?url=${encodeURIComponent(`${YT2009_BASE}/get_video?video_id=${videoId}`)}`;
 
-      return json({
-        id: details.id,
-        title: details.title,
-        description: details.short_description,
-        thumbnail: thumbUrl(details.thumbnail?.[0]?.url),
-        channel: details.author,
-        channelId: details.channel_id,
-        views: details.view_count,
-        likes: details.like_count,
-        duration: details.duration,
-        isLive: details.is_live,
-        isShort: details.is_short,
-        publishedAt: details.publish_date,
-        streamUrl,
-        related,
-      });
+      return json({ id: videoId, ...meta, streamUrl });
     }
+
+    // ─── LIKES (innertube) ───────────────────────────────────────────────
 
     if (path === "/like" && req.method === "POST") {
       const creds = await requireAuth(sessionId);
@@ -285,6 +338,8 @@ Deno.serve(async (req) => {
       await authedYt.interact.dislike(videoId);
       return json({ success: true });
     }
+
+    // ─── COMMENTS (innertube) ────────────────────────────────────────────
 
     if (path.startsWith("/comments/")) {
       const videoId = path.split("/comments/")[1];
@@ -326,29 +381,59 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
+    // ─── CHANNEL (invidious for reliability) ────────────────────────────
+
     if (path.startsWith("/channel/")) {
       const channelId = path.split("/channel/")[1];
       if (!channelId) return err("missing channelId", 400);
-      const channel = await yt.getChannel(channelId);
-      const videos = channel.videos?.map((v: any) => ({
-        id: v.id,
-        title: v.title?.text,
-        thumbnail: thumbUrl(v.thumbnails?.[0]?.url),
-        views: v.view_count?.text,
-        duration: v.duration?.text,
-        publishedAt: v.published?.text,
-      })) ?? [];
-      return json({
-        id: channelId,
-        name: channel.metadata?.title,
-        description: channel.metadata?.description,
-        avatar: thumbUrl(channel.metadata?.avatar?.[0]?.url),
-        banner: thumbUrl(channel.header?.banner?.[0]?.url),
-        subscribers: channel.header?.subscriber_count?.text,
-        verified: channel.header?.is_verified,
-        videos,
-      });
+
+      let name, description, avatar, banner, subscribers, verified, videos: any[] = [];
+
+      // Try innertube first
+      try {
+        const channel = await yt.getChannel(channelId);
+        name = channel.metadata?.title;
+        description = channel.metadata?.description;
+        avatar = thumbUrl(channel.metadata?.avatar?.[0]?.url);
+        banner = thumbUrl(channel.header?.banner?.[0]?.url);
+        subscribers = channel.header?.subscriber_count?.text;
+        verified = channel.header?.is_verified;
+        videos = channel.videos?.map((v: any) => ({
+          id: v.id,
+          title: v.title?.text,
+          thumbnail: thumbUrl(v.thumbnails?.[0]?.url) ?? fallbackThumb(v.id),
+          views: v.view_count?.text,
+          duration: v.duration?.text,
+          publishedAt: v.published?.text,
+        })) ?? [];
+      } catch (_) {}
+
+      // Fall back to invidious
+      if (!name) {
+        try {
+          const res = await fetch(`${INVIDIOUS_BASE}/api/v1/channels/${channelId}`);
+          const data = await res.json();
+          name = data.author;
+          description = data.description;
+          avatar = thumbUrl(data.authorThumbnails?.[0]?.url);
+          banner = thumbUrl(data.authorBanners?.[0]?.url);
+          subscribers = data.subscriberCount;
+          verified = data.isFamilyFriendly;
+          videos = (data.latestVideos ?? []).map((v: any) => ({
+            id: v.videoId,
+            title: v.title,
+            thumbnail: fallbackThumb(v.videoId),
+            views: v.viewCount,
+            duration: v.lengthSeconds,
+            publishedAt: v.published,
+          }));
+        } catch (_) {}
+      }
+
+      return json({ id: channelId, name, description, avatar, banner, subscribers, verified, videos });
     }
+
+    // ─── SHORTS (innertube) ──────────────────────────────────────────────
 
     if (path === "/shorts") {
       const results = await yt.search("trending", { type: "video" });
@@ -357,7 +442,7 @@ Deno.serve(async (req) => {
         .map((v: any) => ({
           id: v.id,
           title: v.title?.text,
-          thumbnail: thumbUrl(v.thumbnails?.[0]?.url),
+          thumbnail: thumbUrl(v.thumbnails?.[0]?.url) ?? fallbackThumb(v.id),
           channel: v.author?.name,
           channelId: v.author?.id,
           views: v.view_count?.text,
@@ -366,7 +451,8 @@ Deno.serve(async (req) => {
       return json({ shorts });
     }
 
-    // Proxy — pipes yt2009.truehosting.net streams through deno, bypassing rkn
+    // ─── PROXY (yt2009 streams + thumbnails through deno) ───────────────
+
     if (path === "/proxy") {
       const target = url.searchParams.get("url");
       if (!target) return err("missing url param", 400);
