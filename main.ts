@@ -35,13 +35,13 @@ const createYt = async (credentials?: any) => {
   return instance;
 };
 
-const createYtAndroid = async (credentials?: any) => {
+// WEB client for stream URLs — uses decipher() which works on deno deploy since eval/new Function is allowed
+const createYtForStreams = async (credentials?: any) => {
   const instance = await Innertube.create({
     location: "RU",
     lang: "ru",
-    client_type: ClientType.ANDROID,
-    retrieve_player: false,
     cache: new UniversalCache(false),
+    retrieve_player: true, // needed for decipher
   });
   if (credentials) await instance.session.signIn(credentials);
   return instance;
@@ -59,13 +59,22 @@ const requireAuth = async (sessionId: string | null) => {
 };
 
 const yt = await createYt();
-const ytAndroid = await createYtAndroid();
+const ytStreams = await createYtForStreams();
 
 const proxyUrl = (rawUrl: string | null | undefined) =>
   rawUrl ? `/proxy?url=${encodeURIComponent(rawUrl)}` : null;
 
 const thumbUrl = (rawUrl: string | null | undefined) =>
   rawUrl ? `/thumbnail?url=${encodeURIComponent(rawUrl)}` : null;
+
+const getUrl = (f: any, player: any) => {
+  try {
+    const deciphered = f.decipher(player);
+    return deciphered ?? f.url ?? null;
+  } catch {
+    return f.url ?? null;
+  }
+};
 
 const mapVideo = (v: any) => ({
   id: v.id,
@@ -159,7 +168,6 @@ Deno.serve(async (req) => {
     }
 
     if (path === "/trending") {
-      // empty search returns popular/trending videos without needing browse IDs
       const results = await yt.search("trending", { type: "video" });
       const videos = results.videos?.map(mapVideo) ?? [];
       return json({ videos });
@@ -229,12 +237,14 @@ Deno.serve(async (req) => {
       if (!videoId) return err("missing videoId", 400);
 
       const creds = await requireAuth(sessionId);
-      const androidInstance = creds ? await createYtAndroid(creds) : ytAndroid;
-      const androidInfo = await androidInstance.getBasicInfo(videoId);
-      const streamingData = androidInfo.streaming_data;
+      // Use streams instance (retrieve_player: true) for deciphering
+      const streamInstance = creds ? await createYtForStreams(creds) : ytStreams;
+      const streamInfo = await streamInstance.getBasicInfo(videoId);
+      const streamingData = streamInfo.streaming_data;
+      const player = streamInstance.session.player;
 
       const formats = (streamingData?.formats ?? []).map((f: any) => ({
-        url: proxyUrl(f.url),
+        url: proxyUrl(getUrl(f, player)),
         quality: f.quality_label ?? f.quality,
         mimeType: f.mime_type,
         bitrate: f.bitrate,
@@ -244,10 +254,10 @@ Deno.serve(async (req) => {
         audioQuality: f.audio_quality,
         hasAudio: !!f.audio_quality,
         hasVideo: !!f.width,
-      }));
+      })).filter((f: any) => f.url);
 
       const adaptiveFormats = (streamingData?.adaptive_formats ?? []).map((f: any) => ({
-        url: proxyUrl(f.url),
+        url: proxyUrl(getUrl(f, player)),
         quality: f.quality_label ?? f.quality,
         mimeType: f.mime_type,
         bitrate: f.bitrate,
@@ -257,7 +267,7 @@ Deno.serve(async (req) => {
         audioQuality: f.audio_quality,
         isAudioOnly: f.mime_type?.startsWith("audio"),
         isVideoOnly: f.mime_type?.startsWith("video") && !f.audio_quality,
-      }));
+      })).filter((f: any) => f.url);
 
       const webInstance = creds ? await createYt(creds) : yt;
       const webInfo = await webInstance.getInfo(videoId);
@@ -409,7 +419,7 @@ Deno.serve(async (req) => {
 
       const range = req.headers.get("range");
       const fetchHeaders: HeadersInit = {
-        "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 11)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": "https://www.youtube.com/",
         "Origin": "https://www.youtube.com",
       };
