@@ -1,4 +1,11 @@
-import { Innertube, UniversalCache } from "npm:youtubei.js";
+import { Innertube, Platform, UniversalCache } from "npm:youtubei.js";
+import type { Types } from "npm:youtubei.js";
+
+// Set custom JS evaluator BEFORE any Innertube.create() calls
+// Required for deciphering stream URLs — deno allows new Function
+Platform.shim.eval = async (data: Types.BuildScriptResult) => {
+  return new Function(data.output)();
+};
 
 const kv = await Deno.openKv();
 
@@ -17,11 +24,6 @@ function err(msg: string, status = 500) {
   return json({ error: msg }, status);
 }
 
-// Custom JS evaluator for deciphering — deno allows new Function
-const customEvaluator = (code: string) => {
-  return new Function(code)();
-};
-
 const createYt = async (credentials?: any) => {
   const instance = await Innertube.create({
     location: "US",
@@ -39,10 +41,6 @@ const createYtForStreams = async (credentials?: any) => {
     cache: new UniversalCache(false),
     retrieve_player: true,
   });
-  // provide custom evaluator for deciphering stream URLs
-  if (instance.session.player) {
-    (instance.session.player as any).evaluate = customEvaluator;
-  }
   if (credentials) await instance.session.signIn(credentials);
   return instance;
 };
