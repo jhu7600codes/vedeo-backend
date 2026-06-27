@@ -92,8 +92,6 @@ Deno.serve(async (req) => {
 
   try {
 
-    // ─── AUTH ────────────────────────────────────────────────────────────
-
     if (path === "/auth/start" && req.method === "POST") {
       const id = crypto.randomUUID();
       const tvYt = await createTvYt();
@@ -151,8 +149,6 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
-    // ─── FEED ────────────────────────────────────────────────────────────
-
     if (path === "/feed") {
       const creds = await requireAuth(sessionId);
       if (!creds) return json({ error: "feed_404" }, 401);
@@ -163,13 +159,11 @@ Deno.serve(async (req) => {
     }
 
     if (path === "/trending") {
-      // FEtrending is the innertube browse ID for the trending page, no auth needed
-      const trending = await yt.getChannel("FEtrending");
-      const videos = trending.videos?.map(mapVideo) ?? [];
+      // empty search returns popular/trending videos without needing browse IDs
+      const results = await yt.search("", { type: "video" });
+      const videos = results.videos?.map(mapVideo) ?? [];
       return json({ videos });
     }
-
-    // ─── SUBSCRIPTIONS ───────────────────────────────────────────────────
 
     if (path === "/subscriptions") {
       const creds = await requireAuth(sessionId);
@@ -200,8 +194,6 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
-    // ─── SEARCH ──────────────────────────────────────────────────────────
-
     if (path === "/search") {
       const q = url.searchParams.get("q");
       if (!q) return err("missing q param", 400);
@@ -231,8 +223,6 @@ Deno.serve(async (req) => {
       const suggestions = await yt.getSearchSuggestions(q);
       return json({ suggestions });
     }
-
-    // ─── VIDEO ───────────────────────────────────────────────────────────
 
     if (path.startsWith("/video/")) {
       const videoId = path.split("/video/")[1];
@@ -304,8 +294,6 @@ Deno.serve(async (req) => {
       });
     }
 
-    // ─── LIKES ───────────────────────────────────────────────────────────
-
     if (path === "/like" && req.method === "POST") {
       const creds = await requireAuth(sessionId);
       if (!creds) return err("not authenticated", 401);
@@ -335,8 +323,6 @@ Deno.serve(async (req) => {
       await authedYt.interact.dislike(videoId);
       return json({ success: true });
     }
-
-    // ─── COMMENTS ────────────────────────────────────────────────────────
 
     if (path.startsWith("/comments/")) {
       const videoId = path.split("/comments/")[1];
@@ -378,8 +364,6 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
-    // ─── CHANNEL ─────────────────────────────────────────────────────────
-
     if (path.startsWith("/channel/")) {
       const channelId = path.split("/channel/")[1];
       if (!channelId) return err("missing channelId", 400);
@@ -404,11 +388,9 @@ Deno.serve(async (req) => {
       });
     }
 
-    // ─── SHORTS ──────────────────────────────────────────────────────────
-
     if (path === "/shorts") {
-      const trending = await yt.getChannel("FEtrending");
-      const shorts = (trending.videos ?? [])
+      const results = await yt.search("", { type: "video" });
+      const shorts = (results.videos ?? [])
         .filter((v: any) => v.is_short)
         .map((v: any) => ({
           id: v.id,
@@ -420,8 +402,6 @@ Deno.serve(async (req) => {
         }));
       return json({ shorts });
     }
-
-    // ─── PROXY ───────────────────────────────────────────────────────────
 
     if (path === "/proxy") {
       const target = url.searchParams.get("url");
