@@ -7,8 +7,8 @@ Platform.shim.eval = async (data: Types.BuildScriptResult) => {
 
 const kv = await Deno.openKv();
 
-const YT2009_BASE = "https://yt2009.truehosting.net";
 const INVIDIOUS_BASE = "https://inv.thepixora.com";
+const TRUEHOSTING_BASE = "https://inv.truehosting.net";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -25,11 +25,55 @@ function err(msg: string, status = 500) {
   return json({ error: msg }, status);
 }
 
+// Steal po_token from inv.truehosting.net — they generate it for us
+async function stealPoToken(videoId: string): Promise<{ poToken: string; visitorData: string } | null> {
+  try {
+    // Check KV cache first (cache for 30 mins since tokens expire)
+    const cached = (await kv.get(["stolen_pot", videoId])).value as any;
+    if (cached && Date.now() - cached.cachedAt < 30 * 60 * 1000) {
+      return cached;
+    }
+
+    const res = await fetch(
+      `${TRUEHOSTING_BASE}/embed/${videoId}?raw=1&quality=dash`,
+      { redirect: "manual" }
+    );
+
+    const location = res.headers.get("location");
+    if (!location) return null;
+
+    const redirectUrl = new URL(location);
+    const poToken = redirectUrl.searchParams.get("pot");
+    const visitorData = redirectUrl.searchParams.get("ip") ?? ""; // use their IP as visitor data approximation
+
+    if (!poToken) return null;
+
+    const result = { poToken, visitorData, cachedAt: Date.now() };
+    await kv.set(["stolen_pot", videoId], result);
+    return result;
+  } catch {
+    return null;
+  }
+}
+
 const createYt = async (credentials?: any) => {
   const instance = await Innertube.create({
     location: "US",
     lang: "en",
     cache: new UniversalCache(false),
+  });
+  if (credentials) await instance.session.signIn(credentials);
+  return instance;
+};
+
+const createYtForStreams = async (poToken?: string, visitorData?: string, credentials?: any) => {
+  const instance = await Innertube.create({
+    location: "US",
+    lang: "en",
+    cache: new UniversalCache(false),
+    retrieve_player: true,
+    po_token: poToken,
+    visitor_data: visitorData,
   });
   if (credentials) await instance.session.signIn(credentials);
   return instance;
@@ -76,11 +120,9 @@ const mapVideo = (v: any) => ({
   isShort: v.is_short,
 });
 
-// Fetch video metadata — innertube first, invidious fallback
 async function getVideoMeta(videoId: string, credentials?: any) {
   let title, description, channel, channelId, views, likes, duration, isLive, isShort, publishedAt, thumbnail, related: any[] = [];
 
-  // Try innertube
   try {
     const webInstance = credentials ? await createYt(credentials) : yt;
     const webInfo = await webInstance.getInfo(videoId);
@@ -111,7 +153,6 @@ async function getVideoMeta(videoId: string, credentials?: any) {
     }
   } catch (_) {}
 
-  // Fall back to invidious if innertube returned nothing
   if (!title) {
     try {
       const res = await fetch(`${INVIDIOUS_BASE}/api/v1/videos/${videoId}`);
@@ -153,8 +194,6 @@ Deno.serve(async (req) => {
   }
 
   try {
-
-    // ─── AUTH (innertube TV OAuth) ───────────────────────────────────────
 
     if (path === "/auth/start" && req.method === "POST") {
       const id = crypto.randomUUID();
@@ -213,8 +252,6 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
-    // ─── FEED (innertube) ────────────────────────────────────────────────
-
     if (path === "/feed") {
       const creds = await requireAuth(sessionId);
       if (!creds) return json({ error: "feed_404" }, 401);
@@ -229,8 +266,6 @@ Deno.serve(async (req) => {
       const videos = results.videos?.map(mapVideo) ?? [];
       return json({ videos });
     }
-
-    // ─── SUBSCRIPTIONS (innertube) ───────────────────────────────────────
 
     if (path === "/subscriptions") {
       const creds = await requireAuth(sessionId);
@@ -260,8 +295,6 @@ Deno.serve(async (req) => {
       await authedYt.interact.unsubscribe(channelId);
       return json({ success: true });
     }
-
-    // ─── SEARCH (innertube) ──────────────────────────────────────────────
 
     if (path === "/search") {
       const q = url.searchParams.get("q");
@@ -293,8 +326,6 @@ Deno.serve(async (req) => {
       return json({ suggestions });
     }
 
-    // ─── VIDEO (innertube metadata + invidious fallback, yt2009 streams) ─
-
     if (path.startsWith("/video/")) {
       const videoId = path.split("/video/")[1];
       if (!videoId) return err("missing videoId", 400);
@@ -302,12 +333,60 @@ Deno.serve(async (req) => {
       const creds = await requireAuth(sessionId);
       const meta = await getVideoMeta(videoId, creds ?? undefined);
 
-      const streamUrl = `/proxy?url=${encodeURIComponent(`${YT2009_BASE}/get_video?video_id=${videoId}`)}`;
+      // Steal po_token from truehosting and use innertube for proper streams
+      const stolen = await stealPoToken(videoId);
 
-      return json({ id: videoId, ...meta, streamUrl });
+      let formats: any[] = [];
+      let adaptiveFormats: any[] = [];
+
+      if (stolen) {
+        try {
+          const streamInstance = await createYtForStreams(stolen.poToken, undefined, creds ?? undefined);
+          const streamInfo = await streamInstance.getBasicInfo(videoId);
+          const streamingData = streamInfo.streaming_data;
+          const player = streamInstance.session.player;
+
+          const getUrl = (f: any) => {
+            try { return f.decipher(player) ?? f.url ?? null; }
+            catch { return f.url ?? null; }
+          };
+
+          formats = (streamingData?.formats ?? []).map((f: any) => ({
+            url: getUrl(f) ? `/proxy?url=${encodeURIComponent(getUrl(f))}` : null,
+            quality: f.quality_label ?? f.quality,
+            mimeType: f.mime_type,
+            width: f.width,
+            height: f.height,
+            fps: f.fps,
+            hasAudio: !!f.audio_quality,
+            hasVideo: !!f.width,
+          })).filter((f: any) => f.url);
+
+          adaptiveFormats = (streamingData?.adaptive_formats ?? []).map((f: any) => ({
+            url: getUrl(f) ? `/proxy?url=${encodeURIComponent(getUrl(f))}` : null,
+            quality: f.quality_label ?? f.quality,
+            mimeType: f.mime_type,
+            width: f.width,
+            height: f.height,
+            fps: f.fps,
+            audioQuality: f.audio_quality,
+            isAudioOnly: f.mime_type?.startsWith("audio"),
+            isVideoOnly: f.mime_type?.startsWith("video") && !f.audio_quality,
+          })).filter((f: any) => f.url);
+        } catch (_) {}
+      }
+
+      // Fallback: use truehosting direct stream if innertube fails
+      const fallbackStreamUrl = `/proxy?url=${encodeURIComponent(`${TRUEHOSTING_BASE}/embed/${videoId}?raw=1&quality=720p`)}`;
+
+      return json({
+        id: videoId,
+        ...meta,
+        formats,
+        adaptiveFormats,
+        fallbackStreamUrl,
+      });
     }
-
-    // ─── LIKES (innertube) ───────────────────────────────────────────────
 
     if (path === "/like" && req.method === "POST") {
       const creds = await requireAuth(sessionId);
@@ -338,8 +417,6 @@ Deno.serve(async (req) => {
       await authedYt.interact.dislike(videoId);
       return json({ success: true });
     }
-
-    // ─── COMMENTS (innertube) ────────────────────────────────────────────
 
     if (path.startsWith("/comments/")) {
       const videoId = path.split("/comments/")[1];
@@ -381,15 +458,12 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
-    // ─── CHANNEL (invidious for reliability) ────────────────────────────
-
     if (path.startsWith("/channel/")) {
       const channelId = path.split("/channel/")[1];
       if (!channelId) return err("missing channelId", 400);
 
       let name, description, avatar, banner, subscribers, verified, videos: any[] = [];
 
-      // Try innertube first
       try {
         const channel = await yt.getChannel(channelId);
         name = channel.metadata?.title;
@@ -408,7 +482,6 @@ Deno.serve(async (req) => {
         })) ?? [];
       } catch (_) {}
 
-      // Fall back to invidious
       if (!name) {
         try {
           const res = await fetch(`${INVIDIOUS_BASE}/api/v1/channels/${channelId}`);
@@ -433,8 +506,6 @@ Deno.serve(async (req) => {
       return json({ id: channelId, name, description, avatar, banner, subscribers, verified, videos });
     }
 
-    // ─── SHORTS (innertube) ──────────────────────────────────────────────
-
     if (path === "/shorts") {
       const results = await yt.search("trending", { type: "video" });
       const shorts = (results.videos ?? [])
@@ -446,12 +517,10 @@ Deno.serve(async (req) => {
           channel: v.author?.name,
           channelId: v.author?.id,
           views: v.view_count?.text,
-          streamUrl: `/proxy?url=${encodeURIComponent(`${YT2009_BASE}/get_video?video_id=${v.id}`)}`,
+          fallbackStreamUrl: `/proxy?url=${encodeURIComponent(`${TRUEHOSTING_BASE}/embed/${v.id}?raw=1&quality=720p`)}`,
         }));
       return json({ shorts });
     }
-
-    // ─── PROXY (yt2009 streams + thumbnails through deno) ───────────────
 
     if (path === "/proxy") {
       const target = url.searchParams.get("url");
@@ -460,11 +529,11 @@ Deno.serve(async (req) => {
       const range = req.headers.get("range");
       const fetchHeaders: HeadersInit = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://yt2009.truehosting.net/",
+        "Referer": "https://inv.truehosting.net/",
       };
       if (range) fetchHeaders["Range"] = range;
 
-      const res = await fetch(target, { headers: fetchHeaders });
+      const res = await fetch(target, { headers: fetchHeaders, redirect: "follow" });
       const contentType = res.headers.get("content-type") ?? "video/mp4";
 
       return new Response(res.body, {
