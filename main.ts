@@ -17,7 +17,6 @@ function err(msg: string, status = 500) {
   return json({ error: msg }, status);
 }
 
-// TV client for OAuth only
 const createTvYt = async () => {
   return await Innertube.create({
     location: "RU",
@@ -26,7 +25,6 @@ const createTvYt = async () => {
   });
 };
 
-// WEB client for metadata, feed, interact — signs in with TV OAuth credentials
 const createYt = async (credentials?: any) => {
   const instance = await Innertube.create({
     location: "RU",
@@ -37,7 +35,6 @@ const createYt = async (credentials?: any) => {
   return instance;
 };
 
-// ANDROID client for stream URLs — pre-deciphered, no eval needed
 const createYtAndroid = async (credentials?: any) => {
   const instance = await Innertube.create({
     location: "RU",
@@ -61,7 +58,6 @@ const requireAuth = async (sessionId: string | null) => {
   return session.credentials;
 };
 
-// Shared unauthenticated instances
 const yt = await createYt();
 const ytAndroid = await createYtAndroid();
 
@@ -96,13 +92,10 @@ Deno.serve(async (req) => {
 
   try {
 
-    // ─── AUTH (TV OAuth only) ────────────────────────────────────────────
+    // ─── AUTH ────────────────────────────────────────────────────────────
 
-    // POST /auth/start — begin TV OAuth flow
     if (path === "/auth/start" && req.method === "POST") {
       const id = crypto.randomUUID();
-
-      // TV client is required for OAuth2
       const tvYt = await createTvYt();
 
       tvYt.session.on("auth-pending", async (data: any) => {
@@ -117,11 +110,7 @@ Deno.serve(async (req) => {
 
       tvYt.session.on("auth", async ({ credentials }: any) => {
         const existing = (await kv.get(["session", id])).value as any ?? {};
-        await kv.set(["session", id], {
-          ...existing,
-          status: "authenticated",
-          credentials,
-        });
+        await kv.set(["session", id], { ...existing, status: "authenticated", credentials });
       });
 
       tvYt.session.on("update-credentials", async ({ credentials }: any) => {
@@ -129,10 +118,7 @@ Deno.serve(async (req) => {
         await kv.set(["session", id], { ...existing, credentials });
       });
 
-      // Start sign in — fires auth-pending immediately
       tvYt.session.signIn().catch(console.error);
-
-      // Wait for auth-pending to populate KV
       await new Promise(resolve => setTimeout(resolve, 3000));
 
       const session = (await kv.get(["session", id])).value as any;
@@ -146,7 +132,6 @@ Deno.serve(async (req) => {
       });
     }
 
-    // GET /auth/status?session_id=... — poll until authenticated
     if (path === "/auth/status") {
       const id = url.searchParams.get("session_id");
       if (!id) return err("missing session_id", 400);
@@ -159,7 +144,6 @@ Deno.serve(async (req) => {
       });
     }
 
-    // GET /auth/logout
     if (path === "/auth/logout") {
       const id = url.searchParams.get("session_id") ?? sessionId;
       if (!id) return err("missing session_id", 400);
@@ -169,7 +153,6 @@ Deno.serve(async (req) => {
 
     // ─── FEED ────────────────────────────────────────────────────────────
 
-    // GET /feed — personalized home feed (requires auth)
     if (path === "/feed") {
       const creds = await requireAuth(sessionId);
       if (!creds) return json({ error: "feed_404" }, 401);
@@ -179,16 +162,14 @@ Deno.serve(async (req) => {
       return json({ videos });
     }
 
-    // GET /trending
     if (path === "/trending") {
-      const feed = await yt.getTrending();
-      const videos = feed.videos.map(mapVideo);
+      const feed = await yt.getHomeFeed();
+      const videos = feed.videos?.map(mapVideo) ?? [];
       return json({ videos });
     }
 
     // ─── SUBSCRIPTIONS ───────────────────────────────────────────────────
 
-    // GET /subscriptions — subscription feed (requires auth)
     if (path === "/subscriptions") {
       const creds = await requireAuth(sessionId);
       if (!creds) return json({ error: "feed_404" }, 401);
@@ -198,7 +179,6 @@ Deno.serve(async (req) => {
       return json({ videos });
     }
 
-    // POST /subscribe — subscribe to channel (requires auth)
     if (path === "/subscribe" && req.method === "POST") {
       const creds = await requireAuth(sessionId);
       if (!creds) return err("not authenticated", 401);
@@ -209,7 +189,6 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
-    // DELETE /subscribe — unsubscribe from channel (requires auth)
     if (path === "/subscribe" && req.method === "DELETE") {
       const creds = await requireAuth(sessionId);
       if (!creds) return err("not authenticated", 401);
@@ -222,7 +201,6 @@ Deno.serve(async (req) => {
 
     // ─── SEARCH ──────────────────────────────────────────────────────────
 
-    // GET /search?q=query
     if (path === "/search") {
       const q = url.searchParams.get("q");
       if (!q) return err("missing q param", 400);
@@ -246,7 +224,6 @@ Deno.serve(async (req) => {
       return json({ items });
     }
 
-    // GET /suggestions?q=...
     if (path === "/suggestions") {
       const q = url.searchParams.get("q");
       if (!q) return err("missing q param", 400);
@@ -256,14 +233,11 @@ Deno.serve(async (req) => {
 
     // ─── VIDEO ───────────────────────────────────────────────────────────
 
-    // GET /video/:id
     if (path.startsWith("/video/")) {
       const videoId = path.split("/video/")[1];
       if (!videoId) return err("missing videoId", 400);
 
       const creds = await requireAuth(sessionId);
-
-      // ANDROID client for stream URLs (pre-deciphered, no eval)
       const androidInstance = creds ? await createYtAndroid(creds) : ytAndroid;
       const androidInfo = await androidInstance.getBasicInfo(videoId);
       const streamingData = androidInfo.streaming_data;
@@ -294,7 +268,6 @@ Deno.serve(async (req) => {
         isVideoOnly: f.mime_type?.startsWith("video") && !f.audio_quality,
       }));
 
-      // WEB client for metadata + related
       const webInstance = creds ? await createYt(creds) : yt;
       const webInfo = await webInstance.getInfo(videoId);
       const details = webInfo.basic_info;
@@ -332,7 +305,6 @@ Deno.serve(async (req) => {
 
     // ─── LIKES ───────────────────────────────────────────────────────────
 
-    // POST /like (requires auth)
     if (path === "/like" && req.method === "POST") {
       const creds = await requireAuth(sessionId);
       if (!creds) return err("not authenticated", 401);
@@ -343,7 +315,6 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
-    // DELETE /like (requires auth)
     if (path === "/like" && req.method === "DELETE") {
       const creds = await requireAuth(sessionId);
       if (!creds) return err("not authenticated", 401);
@@ -354,7 +325,6 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
-    // POST /dislike (requires auth)
     if (path === "/dislike" && req.method === "POST") {
       const creds = await requireAuth(sessionId);
       if (!creds) return err("not authenticated", 401);
@@ -367,12 +337,10 @@ Deno.serve(async (req) => {
 
     // ─── COMMENTS ────────────────────────────────────────────────────────
 
-    // GET /comments/:id
     if (path.startsWith("/comments/")) {
       const videoId = path.split("/comments/")[1];
       if (!videoId) return err("missing videoId", 400);
-      const info = await yt.getInfo(videoId);
-      const comments = await info.getComments();
+      const comments = await yt.getComments(videoId);
       const items = comments.contents?.map((c: any) => ({
         id: c.comment?.id,
         text: c.comment?.content?.text,
@@ -387,7 +355,6 @@ Deno.serve(async (req) => {
       return json({ items, totalCount: comments.header?.comments_count?.text });
     }
 
-    // POST /comment — post a comment (requires auth)
     if (path === "/comment" && req.method === "POST") {
       const creds = await requireAuth(sessionId);
       if (!creds) return err("not authenticated", 401);
@@ -398,15 +365,13 @@ Deno.serve(async (req) => {
       return json({ success: true });
     }
 
-    // POST /comment/like — like a comment (requires auth)
     if (path === "/comment/like" && req.method === "POST") {
       const creds = await requireAuth(sessionId);
       if (!creds) return err("not authenticated", 401);
       const { videoId, commentId } = await req.json();
       if (!videoId || !commentId) return err("missing videoId or commentId", 400);
       const authedYt = await createYt(creds);
-      const info = await authedYt.getInfo(videoId);
-      const comments = await info.getComments();
+      const comments = await authedYt.getComments(videoId);
       const comment = comments.contents?.find((c: any) => c.comment?.id === commentId);
       if (comment?.comment) await comment.comment.like();
       return json({ success: true });
@@ -414,7 +379,6 @@ Deno.serve(async (req) => {
 
     // ─── CHANNEL ─────────────────────────────────────────────────────────
 
-    // GET /channel/:id
     if (path.startsWith("/channel/")) {
       const channelId = path.split("/channel/")[1];
       if (!channelId) return err("missing channelId", 400);
@@ -441,10 +405,9 @@ Deno.serve(async (req) => {
 
     // ─── SHORTS ──────────────────────────────────────────────────────────
 
-    // GET /shorts
     if (path === "/shorts") {
-      const feed = await yt.getTrending();
-      const shorts = feed.videos
+      const feed = await yt.getHomeFeed();
+      const shorts = (feed.videos ?? [])
         .filter((v: any) => v.is_short)
         .map((v: any) => ({
           id: v.id,
@@ -459,7 +422,6 @@ Deno.serve(async (req) => {
 
     // ─── PROXY ───────────────────────────────────────────────────────────
 
-    // GET /proxy?url=... — pipes stream through deno, bypassing rkn
     if (path === "/proxy") {
       const target = url.searchParams.get("url");
       if (!target) return err("missing url param", 400);
@@ -487,7 +449,6 @@ Deno.serve(async (req) => {
       });
     }
 
-    // GET /thumbnail?url=... — proxies thumbnails/avatars, cached 24h
     if (path === "/thumbnail") {
       const target = url.searchParams.get("url");
       if (!target) return err("missing url param", 400);
