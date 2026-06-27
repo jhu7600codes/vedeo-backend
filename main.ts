@@ -160,7 +160,7 @@ Deno.serve(async (req) => {
 
     if (path === "/trending") {
       // empty search returns popular/trending videos without needing browse IDs
-      const results = await yt.search("", { type: "video" });
+      const results = await yt.search("trending", { type: "video" });
       const videos = results.videos?.map(mapVideo) ?? [];
       return json({ videos });
     }
@@ -389,7 +389,7 @@ Deno.serve(async (req) => {
     }
 
     if (path === "/shorts") {
-      const results = await yt.search("", { type: "video" });
+      const results = await yt.search("trending", { type: "video" });
       const shorts = (results.videos ?? [])
         .filter((v: any) => v.is_short)
         .map((v: any) => ({
