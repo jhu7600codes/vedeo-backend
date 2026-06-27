@@ -163,8 +163,9 @@ Deno.serve(async (req) => {
     }
 
     if (path === "/trending") {
-      const feed = await yt.getHomeFeed();
-      const videos = feed.videos?.map(mapVideo) ?? [];
+      // FEtrending is the innertube browse ID for the trending page, no auth needed
+      const trending = await yt.getChannel("FEtrending");
+      const videos = trending.videos?.map(mapVideo) ?? [];
       return json({ videos });
     }
 
@@ -406,8 +407,8 @@ Deno.serve(async (req) => {
     // ─── SHORTS ──────────────────────────────────────────────────────────
 
     if (path === "/shorts") {
-      const feed = await yt.getHomeFeed();
-      const shorts = (feed.videos ?? [])
+      const trending = await yt.getChannel("FEtrending");
+      const shorts = (trending.videos ?? [])
         .filter((v: any) => v.is_short)
         .map((v: any) => ({
           id: v.id,
