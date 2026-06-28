@@ -322,7 +322,7 @@ Deno.serve(async (req) => {
 
       try {
         const streamInstance = await createYtForStreams(creds ?? undefined);
-        const streamInfo = await streamInstance.getBasicInfo(videoId);
+        const streamInfo = await streamInstance.getInfo(videoId);
         const streamingData = streamInfo.streaming_data;
         console.log("streaming_data formats:", streamingData?.formats?.length, "adaptive:", streamingData?.adaptive_formats?.length, "has_player:", !!streamInstance.session.player);
         const player = streamInstance.session.player;
