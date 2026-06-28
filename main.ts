@@ -7,6 +7,7 @@ Platform.shim.eval = async (data: Types.BuildScriptResult) => {
 
 const kv = await Deno.openKv();
 
+const BGUTIL_SERVER = "http://13.60.7.198:4416";
 const INVIDIOUS_BASE = "https://inv.thepixora.com";
 const TRUEHOSTING_BASE = "https://inv.truehosting.net";
 
@@ -25,35 +26,16 @@ function err(msg: string, status = 500) {
   return json({ error: msg }, status);
 }
 
-// Steal po_token from inv.truehosting.net — they generate it for us
-async function stealPoToken(videoId: string): Promise<{ poToken: string; visitorData: string } | null> {
-  try {
-    // Check KV cache first (cache for 30 mins since tokens expire)
-    const cached = (await kv.get(["stolen_pot", videoId])).value as any;
-    if (cached && Date.now() - cached.cachedAt < 30 * 60 * 1000) {
-      return cached;
-    }
-
-    const res = await fetch(
-      `${TRUEHOSTING_BASE}/embed/${videoId}?raw=1&quality=dash`,
-      { redirect: "manual" }
-    );
-
-    const location = res.headers.get("location");
-    if (!location) return null;
-
-    const redirectUrl = new URL(location);
-    const poToken = redirectUrl.searchParams.get("pot");
-    const visitorData = redirectUrl.searchParams.get("ip") ?? ""; // use their IP as visitor data approximation
-
-    if (!poToken) return null;
-
-    const result = { poToken, visitorData, cachedAt: Date.now() };
-    await kv.set(["stolen_pot", videoId], result);
-    return result;
-  } catch {
-    return null;
+// Get po_token from AWS bgutil server, cached in KV for 6 hours
+async function getPoToken(): Promise<{ poToken: string; visitorData: string }> {
+  const cached = (await kv.get(["po_token"])).value as any;
+  if (cached && Date.now() - cached.cachedAt < 6 * 60 * 60 * 1000) {
+    return cached;
   }
+  const res = await fetch(BGUTIL_SERVER);
+  const data = await res.json();
+  await kv.set(["po_token"], { ...data, cachedAt: Date.now() });
+  return data;
 }
 
 const createYt = async (credentials?: any) => {
@@ -66,7 +48,8 @@ const createYt = async (credentials?: any) => {
   return instance;
 };
 
-const createYtForStreams = async (poToken?: string, visitorData?: string, credentials?: any) => {
+const createYtForStreams = async (credentials?: any) => {
+  const { poToken, visitorData } = await getPoToken();
   const instance = await Innertube.create({
     location: "US",
     lang: "en",
@@ -333,60 +316,59 @@ Deno.serve(async (req) => {
       const creds = await requireAuth(sessionId);
       const meta = await getVideoMeta(videoId, creds ?? undefined);
 
-      // Steal po_token from truehosting and use innertube for proper streams
-      const stolen = await stealPoToken(videoId);
-
+      // Get stream URLs from innertube using real po_token from AWS bgutil
       let formats: any[] = [];
       let adaptiveFormats: any[] = [];
 
-      if (stolen) {
-        try {
-          const streamInstance = await createYtForStreams(stolen.poToken, undefined, creds ?? undefined);
-          const streamInfo = await streamInstance.getBasicInfo(videoId);
-          const streamingData = streamInfo.streaming_data;
-          const player = streamInstance.session.player;
+      try {
+        const streamInstance = await createYtForStreams(creds ?? undefined);
+        const streamInfo = await streamInstance.getBasicInfo(videoId);
+        const streamingData = streamInfo.streaming_data;
+        const player = streamInstance.session.player;
 
-          const getUrl = (f: any) => {
-            try { return f.decipher(player) ?? f.url ?? null; }
-            catch { return f.url ?? null; }
-          };
+        const getUrl = (f: any) => {
+          try { return f.decipher(player) ?? f.url ?? null; }
+          catch { return f.url ?? null; }
+        };
 
-          formats = (streamingData?.formats ?? []).map((f: any) => ({
-            url: getUrl(f) ? `/proxy?url=${encodeURIComponent(getUrl(f))}` : null,
-            quality: f.quality_label ?? f.quality,
-            mimeType: f.mime_type,
-            width: f.width,
-            height: f.height,
-            fps: f.fps,
-            hasAudio: !!f.audio_quality,
-            hasVideo: !!f.width,
-          })).filter((f: any) => f.url);
+        formats = (streamingData?.formats ?? []).map((f: any) => ({
+          url: getUrl(f) ? `/proxy?url=${encodeURIComponent(getUrl(f))}` : null,
+          quality: f.quality_label ?? f.quality,
+          mimeType: f.mime_type,
+          width: f.width,
+          height: f.height,
+          fps: f.fps,
+          hasAudio: !!f.audio_quality,
+          hasVideo: !!f.width,
+        })).filter((f: any) => f.url);
 
-          adaptiveFormats = (streamingData?.adaptive_formats ?? []).map((f: any) => ({
-            url: getUrl(f) ? `/proxy?url=${encodeURIComponent(getUrl(f))}` : null,
-            quality: f.quality_label ?? f.quality,
-            mimeType: f.mime_type,
-            width: f.width,
-            height: f.height,
-            fps: f.fps,
-            audioQuality: f.audio_quality,
-            isAudioOnly: f.mime_type?.startsWith("audio"),
-            isVideoOnly: f.mime_type?.startsWith("video") && !f.audio_quality,
-          })).filter((f: any) => f.url);
-        } catch (_) {}
+        adaptiveFormats = (streamingData?.adaptive_formats ?? []).map((f: any) => ({
+          url: getUrl(f) ? `/proxy?url=${encodeURIComponent(getUrl(f))}` : null,
+          quality: f.quality_label ?? f.quality,
+          mimeType: f.mime_type,
+          width: f.width,
+          height: f.height,
+          fps: f.fps,
+          audioQuality: f.audio_quality,
+          isAudioOnly: f.mime_type?.startsWith("audio"),
+          isVideoOnly: f.mime_type?.startsWith("video") && !f.audio_quality,
+        })).filter((f: any) => f.url);
+      } catch (e) {
+        console.error("Stream fetch failed:", e);
       }
 
-      // Fallback: use truehosting direct stream if innertube fails
-      const fallbackStreamUrl = `/proxy?url=${encodeURIComponent(`${TRUEHOSTING_BASE}/embed/${videoId}?raw=1&quality=720p`)}`;
+      // DASH manifest with rewritten URLs as fallback
       const dashManifestUrl = `/manifest/${videoId}.mpd`;
+      // Direct stream fallback
+      const fallbackStreamUrl = `/proxy?url=${encodeURIComponent(`${TRUEHOSTING_BASE}/embed/${videoId}?raw=1&quality=720p`)}`;
 
       return json({
         id: videoId,
         ...meta,
         formats,
         adaptiveFormats,
-        fallbackStreamUrl,
         dashManifestUrl,
+        fallbackStreamUrl,
       });
     }
 
@@ -524,7 +506,7 @@ Deno.serve(async (req) => {
       return json({ shorts });
     }
 
-    // GET /manifest/{videoId}.mpd — rewrites DASH manifest URLs through deno proxy
+    // DASH manifest with rewritten URLs
     if (path.startsWith("/manifest/") && path.endsWith(".mpd")) {
       const videoId = path.split("/manifest/")[1].replace(".mpd", "");
       if (!videoId) return err("missing videoId", 400);
@@ -537,8 +519,6 @@ Deno.serve(async (req) => {
       if (!res.ok) return err("failed to fetch manifest", 502);
 
       let manifest = await res.text();
-
-      // Rewrite all googlevideo.com URLs through our proxy so rkn can't block them
       manifest = manifest.replace(
         /https:\/\/[a-z0-9\-\.]+\.googlevideo\.com\/[^\s"<]*/g,
         (match) => `https://vedeo-backend.vedeo.deno.net/proxy?url=${encodeURIComponent(match)}`
@@ -561,7 +541,8 @@ Deno.serve(async (req) => {
       const range = req.headers.get("range");
       const fetchHeaders: HeadersInit = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://inv.truehosting.net/",
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
       };
       if (range) fetchHeaders["Range"] = range;
 
