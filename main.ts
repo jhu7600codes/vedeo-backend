@@ -48,7 +48,7 @@ const createYt = async (credentials?: any) => {
   return instance;
 };
 
-const createYtForStreams = async (credentials?: any) => {
+const createYtForStreams = async (credentials: any) => {
   const { poToken, visitorData } = await getPoToken();
   const instance = await Innertube.create({
     location: "US",
@@ -58,7 +58,7 @@ const createYtForStreams = async (credentials?: any) => {
     po_token: poToken,
     visitor_data: visitorData,
   });
-  if (credentials) await instance.session.signIn(credentials);
+  await instance.session.signIn(credentials);
   return instance;
 };
 
@@ -316,46 +316,48 @@ Deno.serve(async (req) => {
       const creds = await requireAuth(sessionId);
       const meta = await getVideoMeta(videoId, creds ?? undefined);
 
-      // Get stream URLs from innertube using real po_token from AWS bgutil
+      // Get stream URLs from innertube using real po_token — requires login
       let formats: any[] = [];
       let adaptiveFormats: any[] = [];
 
-      try {
-        const streamInstance = await createYtForStreams(creds ?? undefined);
-        const streamInfo = await streamInstance.getInfo(videoId);
-        const streamingData = streamInfo.streaming_data;
-        console.log("streaming_data formats:", streamingData?.formats?.length, "adaptive:", streamingData?.adaptive_formats?.length, "has_player:", !!streamInstance.session.player);
-        const player = streamInstance.session.player;
+      if (creds) {
+        try {
+          const streamInstance = await createYtForStreams(creds);
+          const streamInfo = await streamInstance.getInfo(videoId);
+          const streamingData = streamInfo.streaming_data;
+          console.log("streaming_data formats:", streamingData?.formats?.length, "adaptive:", streamingData?.adaptive_formats?.length);
+          const player = streamInstance.session.player;
 
-        const getUrl = (f: any) => {
-          try { return f.decipher(player) ?? f.url ?? null; }
-          catch { return f.url ?? null; }
-        };
+          const getUrl = (f: any) => {
+            try { return f.decipher(player) ?? f.url ?? null; }
+            catch { return f.url ?? null; }
+          };
 
-        formats = (streamingData?.formats ?? []).map((f: any) => ({
-          url: getUrl(f) ? `/proxy?url=${encodeURIComponent(getUrl(f))}` : null,
-          quality: f.quality_label ?? f.quality,
-          mimeType: f.mime_type,
-          width: f.width,
-          height: f.height,
-          fps: f.fps,
-          hasAudio: !!f.audio_quality,
-          hasVideo: !!f.width,
-        })).filter((f: any) => f.url);
+          formats = (streamingData?.formats ?? []).map((f: any) => ({
+            url: getUrl(f) ? `/proxy?url=${encodeURIComponent(getUrl(f))}` : null,
+            quality: f.quality_label ?? f.quality,
+            mimeType: f.mime_type,
+            width: f.width,
+            height: f.height,
+            fps: f.fps,
+            hasAudio: !!f.audio_quality,
+            hasVideo: !!f.width,
+          })).filter((f: any) => f.url);
 
-        adaptiveFormats = (streamingData?.adaptive_formats ?? []).map((f: any) => ({
-          url: getUrl(f) ? `/proxy?url=${encodeURIComponent(getUrl(f))}` : null,
-          quality: f.quality_label ?? f.quality,
-          mimeType: f.mime_type,
-          width: f.width,
-          height: f.height,
-          fps: f.fps,
-          audioQuality: f.audio_quality,
-          isAudioOnly: f.mime_type?.startsWith("audio"),
-          isVideoOnly: f.mime_type?.startsWith("video") && !f.audio_quality,
-        })).filter((f: any) => f.url);
-      } catch (e) {
-        console.error("Stream fetch failed:", e);
+          adaptiveFormats = (streamingData?.adaptive_formats ?? []).map((f: any) => ({
+            url: getUrl(f) ? `/proxy?url=${encodeURIComponent(getUrl(f))}` : null,
+            quality: f.quality_label ?? f.quality,
+            mimeType: f.mime_type,
+            width: f.width,
+            height: f.height,
+            fps: f.fps,
+            audioQuality: f.audio_quality,
+            isAudioOnly: f.mime_type?.startsWith("audio"),
+            isVideoOnly: f.mime_type?.startsWith("video") && !f.audio_quality,
+          })).filter((f: any) => f.url);
+        } catch (e) {
+          console.error("Stream fetch failed:", e);
+        }
       }
 
       // DASH manifest with rewritten URLs as fallback
